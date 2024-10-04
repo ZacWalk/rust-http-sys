@@ -1,23 +1,17 @@
-use clap::{command, Parser, Subcommand};
+use clap::{Parser, Subcommand};
+use httpsys::{Response, ServerBuilder};
 use plotters::prelude::*;
 use plotters::style::{BLUE, WHITE};
-use rand::distributions::Alphanumeric;
-use rand::prelude::Distribution;
-use rand::thread_rng;
+use rand::distributions::{Alphanumeric, DistString};
 use reqwest::blocking::Client;
 use reqwest::{Proxy, Url};
-use server::Server;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::time::Instant;
 use std::{thread, time::Duration};
-use tokio::signal;
-use tokio::task;
 use util::print_latency;
 use util::{measure_latency, run_this_exe_as_server};
 
-mod httpsys;
-mod server;
 mod util;
 
 /// Network latency tester.
@@ -77,24 +71,11 @@ fn main() {
 
     match &args.command {
         Mode::Server { receive_url } => {
-            println!("Server running on {receive_url}/test/");
-            let mut server = Server::new();
-            let test_url = {
-                let mut url = receive_url.clone();
-                url.set_path("/test");
-                url
-            };
-            let kill_url = {
-                let mut url = receive_url.clone();
-                url.set_path("/kill");
-                url
-            };
-            let handlers: Vec<(&Url, fn(&str) -> (String, bool))> = vec![
-                (&test_url, |_| ("OK".to_string(), false)),
-                (&kill_url, |_| ("OK".to_string(), true)),
-            ];
-            server.define_handlers(handlers);
-            server.wait();
+            println!("Server running on {receive_url}test/");
+            if let Err(e) = run_server_mode(receive_url) {
+                eprintln!("Server failed: {e}");
+                std::process::exit(1);
+            }
         }
         Mode::Client {
             send_url,
@@ -103,8 +84,10 @@ fn main() {
             println!("Client sending to: {send_url}");
             println!("Validate SSL certificates: {}", !args.no_validate_certs);
 
+            let client = build_client(proxy_url, args.no_validate_certs)
+                .expect("failed to build HTTP client");
             let average_latency = measure_latency(|| {
-                let _ = send_get_request(send_url, proxy_url, args.no_validate_certs);
+                let _ = send_get_request(&client, send_url);
             });
 
             print_latency(&average_latency);
@@ -116,8 +99,10 @@ fn main() {
             println!("Client sending to: {send_url}");
             println!("Validate SSL certificates: {}", !args.no_validate_certs);
 
+            let client = build_client(proxy_url, args.no_validate_certs)
+                .expect("failed to build HTTP client");
             let start_time = Instant::now();
-            let result = send_get_request(send_url, proxy_url, args.no_validate_certs);
+            let result = send_get_request(&client, send_url);
             let latency = start_time.elapsed();
             let mut response_size = 0;
 
@@ -125,15 +110,15 @@ fn main() {
 
             match result {
                 Ok(value) => {
-                    println!("{}", value);
+                    println!("{value}");
                     response_size = value.len();
                 }
-                Err(e) => eprintln!("Error: {}", e),
+                Err(e) => eprintln!("Error: {e}"),
             };
 
             println!("============================================================");
-            println!("Latency: {:?}", latency);
-            println!("Response Size: {} chars", response_size);
+            println!("Latency: {latency:?}");
+            println!("Response Size: {response_size} chars");
         }
         Mode::Test => {
             println!("Test mode");
@@ -145,27 +130,31 @@ fn main() {
             thread::sleep(Duration::from_millis(100));
 
             let send_url = server_exe.format_req_url("/test/");
+            let client =
+                build_client(&None, args.no_validate_certs).expect("failed to build HTTP client");
             let mut measurements = Vec::<Measurement>::new();
-            let mut payload_size = 1024; // Initial payload size
+            let mut payload_size = 1024usize; // Initial payload size
             let target_size = 8 * 1024 * 1024; // 8 MB
 
             while payload_size <= target_size {
                 let random_data = generate_random_payload(payload_size);
                 let latency_result = measure_latency(|| {
-                    task::block_in_place(|| {
-                        let _ = send_post_request(&send_url, &None, args.no_validate_certs, &random_data);                        
-                    })
+                    let _ = send_post_request(&client, &send_url, &random_data);
                 });
 
                 measurements.push(Measurement {
-                    name: &"Request",
+                    name: "Request",
                     latency: latency_result.latency.as_nanos() as u64,
-                    payload_size : payload_size as u64,
+                    payload_size: payload_size as u64,
                 });
 
-                println!("Average latency: {:?} : size {}", latency_result.latency, format_size(payload_size as u64));               
+                println!(
+                    "Average latency: {:?} : size {}",
+                    latency_result.latency,
+                    format_size(payload_size as u64)
+                );
 
-                payload_size += payload_size / 4; // Double the payload size for the next iteration
+                payload_size += payload_size / 4;
             }
 
             write_plot(
@@ -179,118 +168,94 @@ fn main() {
     }
 }
 
-fn send_get_request(
-    url: &Url,
+fn build_client(
     proxy_url: &Option<Url>,
-    validate_certs: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let client = match proxy_url {
-        Some(proxy_url) => {
-            let proxy = Proxy::http(proxy_url.as_str())?;
-            Client::builder()
-                .proxy(proxy)
-                .danger_accept_invalid_certs(validate_certs)
-                .build()?
-        }
-        None => Client::builder()
-            .danger_accept_invalid_certs(validate_certs)            
-            .build()?,
-    };
+    accept_invalid_certs: bool,
+) -> Result<Client, reqwest::Error> {
+    let mut builder = Client::builder().danger_accept_invalid_certs(accept_invalid_certs);
+    if let Some(proxy_url) = proxy_url {
+        builder = builder.proxy(Proxy::http(proxy_url.as_str())?);
+    }
+    builder.build()
+}
 
-    let res = client.get(url.as_str()).header("Cache-Control", "no-cache").send()?;
-    let body = res.text()?;
-    Ok(body)
+fn send_get_request(client: &Client, url: &Url) -> Result<String, Box<dyn std::error::Error>> {
+    let res = client
+        .get(url.as_str())
+        .header("Cache-Control", "no-cache")
+        .send()?;
+    Ok(res.text()?)
 }
 
 fn send_post_request(
+    client: &Client,
     url: &Url,
-    proxy_url: &Option<Url>,
-    validate_certs: bool,
-    random_data: &String,
+    body: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let client = match proxy_url {
-        Some(proxy_url) => {
-            let proxy = Proxy::http(proxy_url.as_str())?;
-            Client::builder()
-                .proxy(proxy)
-                .danger_accept_invalid_certs(validate_certs)
-                .build()?
-        }
-        None => Client::builder()
-            .danger_accept_invalid_certs(validate_certs)
-            .build()?,
-    };
-
     let res = client
         .post(url.as_str())
         .header("Cache-Control", "no-cache")
-        .body(random_data.clone())
+        .body(body.to_owned())
         .send()?;
-
-    let body = res.text()?;
-    Ok(body)
+    Ok(res.text()?)
 }
 
 fn generate_random_payload(data_size: usize) -> String {
-    // Generate random text data
-    let mut rng = thread_rng();
-    let random_data: String = (0..data_size)
-        .map(|_| Alphanumeric.sample(&mut rng))
-        .map(char::from)
-        .collect();
-    random_data
+    Alphanumeric.sample_string(&mut rand::thread_rng(), data_size)
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+/// Spawn the demo server with `/test` and `/kill` routes and block until
+/// shutdown is signalled (either Ctrl+C or a `/kill` request).
+fn run_server_mode(receive_url: &Url) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let kill_flag = std::sync::Arc::new(AtomicBool::new(false));
+
+    let test_url = {
+        let mut u = receive_url.clone();
+        u.set_path("/test");
+        u.to_string()
+    };
+    let kill_url = {
+        let mut u = receive_url.clone();
+        u.set_path("/kill");
+        u.to_string()
     };
 
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+    let mut builder = match ServerBuilder::new() {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(format!("Failed to initialize HTTP server: {e}").into());
+        }
     };
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let kill_clone = kill_flag.clone();
+    builder
+        .route(&test_url, |_req| async { Response::ok_text("OK") })
+        .map_err(|e| {
+            format!(
+                "Failed to bind URL {test_url} (try running elevated, or register a URL ACL with \
+                 `netsh http add urlacl url={receive_url}test/ user=Everyone`): {e}"
+            )
+        })?;
+    builder
+        .route(&kill_url, move |_req| {
+            let kf = kill_clone.clone();
+            async move {
+                kf.store(true, Ordering::SeqCst);
+                Response::ok_text("OK")
+            }
+        })
+        .map_err(|e| format!("Failed to bind {kill_url}: {e}"))?;
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+    let mut handle = builder.run();
+
+    // Poll the kill flag in this thread; the server runs on its own.
+    while !kill_flag.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    use crate::server::Server;
-    use std::{thread, time::Duration};
-
-    #[test]
-    fn test_basic_request() {
-        let port_num = 1919;
-        let server_url = Url::parse(&format!("http://localhost:{}/nop/", port_num)).unwrap();
-
-        let mut server = Server::new();
-        let handlers: Vec<(&Url, fn(&str) -> (String, bool))> =
-            vec![(&server_url, |_| ("OK".to_string(), false))];
-
-        server.define_handlers(handlers);
-
-        thread::sleep(Duration::from_millis(100));
-
-        let result = send_post_request(&server_url, &None, false, &"xxx".to_string()).unwrap();
-        assert_eq!(result, "OK");
-
-        server.kill();
-        server.wait();
-    }
+    handle.shutdown();
+    handle.join();
+    Ok(())
 }
 
 fn format_size(size_in_bytes: u64) -> String {
@@ -302,7 +267,7 @@ fn format_size(size_in_bytes: u64) -> String {
     } else if size_in_bytes >= KB {
         format!("{:.1}kb", size_in_bytes as f64 / KB as f64)
     } else {
-        format!("{}b", size_in_bytes)
+        format!("{size_in_bytes}b")
     }
 }
 
@@ -310,11 +275,10 @@ const FONT: &str = "Fira Code";
 const PLOT_WIDTH: u32 = 800;
 const PLOT_HEIGHT: u32 = 400;
 
-
 pub struct Measurement<'a> {
-    pub name : &'a str,
+    pub name: &'a str,
     pub latency: u64,
-    pub payload_size: u64, 
+    pub payload_size: u64,
 }
 
 pub fn write_plot(
@@ -325,10 +289,9 @@ pub fn write_plot(
 ) -> Result<(), Box<dyn Error>> {
     let mut groups: BTreeMap<&str, Vec<&Measurement>> = BTreeMap::new();
 
-
     for record in records.iter() {
-        let group = groups.entry(record.name).or_insert_with(Vec::new);
-        group.push(&record);
+        let group = groups.entry(record.name).or_default();
+        group.push(record);
     }
 
     let resolution = (PLOT_WIDTH, PLOT_HEIGHT);
@@ -336,16 +299,13 @@ pub fn write_plot(
 
     root.fill(&WHITE)?;
 
-    
     let y_min = records.iter().map(|m| m.latency).min().unwrap();
     let y_max = records.iter().map(|m| m.latency).max().unwrap();
     let y_diff = y_max - y_min;
     let y_padding = (y_diff / 10).min(y_min);
 
-    let x_min = records.iter().map(|m| m.payload_size).min().unwrap();
     let x_max = records.iter().map(|m| m.payload_size).max().unwrap();
 
-    
     let mut chart = ChartBuilder::on(&root)
         .margin(10)
         .caption(caption, (FONT, 20))
@@ -357,7 +317,7 @@ pub fn write_plot(
     chart
         .configure_mesh()
         .disable_y_mesh()
-        .x_label_formatter(&|v| format_size(*v ))
+        .x_label_formatter(&|v| format_size(*v))
         .y_label_formatter(&|v| format!("{:.1} ms", *v as f64 / 1_000_000.0))
         .x_labels(20)
         .y_labels(20)
@@ -387,4 +347,69 @@ pub fn write_plot(
         .draw()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use std::{thread, time::Duration};
+
+    /// Hits a real http.sys-bound URL. Requires either elevation or a
+    /// pre-registered URL ACL (`netsh http add urlacl url=http://+:1919/nop/
+    /// user=Everyone`). Run explicitly with:
+    ///     cargo test -- --ignored
+    #[test]
+    #[ignore = "requires http.sys URL ACL or elevation"]
+    fn test_basic_request() {
+        let port_num = 1919;
+        let server_url = Url::parse(&format!("http://localhost:{port_num}/nop/")).unwrap();
+
+        let mut builder = ServerBuilder::new().expect("server init");
+        builder
+            .route(server_url.as_str(), |_req| async {
+                Response::ok_text("OK")
+            })
+            .expect("bind url");
+        let mut handle = builder.run();
+
+        thread::sleep(Duration::from_millis(100));
+
+        let client = build_client(&None, false).unwrap();
+        let result = send_post_request(&client, &server_url, "xxx").unwrap();
+        assert_eq!(result, "OK");
+
+        handle.shutdown();
+        handle.join();
+    }
+
+    #[test]
+    fn format_size_thresholds() {
+        assert_eq!(format_size(0), "0b");
+        assert_eq!(format_size(512), "512b");
+        assert_eq!(format_size(1024), "1.0kb");
+        assert_eq!(format_size(1536), "1.5kb");
+        assert_eq!(format_size(1024 * 1024), "1.0mb");
+        assert_eq!(format_size(8 * 1024 * 1024), "8.0mb");
+    }
+
+    #[test]
+    fn build_client_no_proxy_succeeds() {
+        let c = build_client(&None, false).expect("client builds");
+        // Smoke-check the type is usable.
+        let _ = c.get("http://127.0.0.1/").build().unwrap();
+    }
+
+    #[test]
+    fn build_client_with_proxy_succeeds() {
+        let proxy = Some(Url::parse("http://localhost:9").unwrap());
+        let _ = build_client(&proxy, true).expect("client builds with proxy");
+    }
+
+    #[test]
+    fn generate_random_payload_size_matches() {
+        let p = generate_random_payload(1234);
+        assert_eq!(p.len(), 1234);
+        assert!(p.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
 }

@@ -1,0 +1,23 @@
+[package]
+name = "httpsys"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Async Rust wrapper around the Windows http.sys server APIs."
+
+[dependencies]
+windows.workspace = true
+atomic-waker.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

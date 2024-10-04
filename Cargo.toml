@@ -1,25 +1,48 @@
+[workspace]
+resolver = "2"
+members = [".", "crates/httpsys"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/microsoft/rust-http-sys"
+
+[workspace.dependencies]
+windows = { version = "0.48", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Networking_HttpServer",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+] }
+atomic-waker = "1.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+bytes = "1.5"
+
 [package]
-name = "net-bench"
+name = "test-httpsys"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies.windows]
-version = "0.48"
-features = [
-    "Win32_Foundation",
-    "Win32_Networking_WinHttp",
-    "Win32_Security",
-    "Win32_System_Threading",
-    "Win32_System_IO",
-    "Win32_Networking_HttpServer",
-    "Win32_Networking_WinSock",
-    "Win32_Storage_FileSystem"
-]
-
 [dependencies]
-clap = { version = "4.5.3", features = ["derive"] }
-rand = "0.8.5"
-reqwest = { version = "0.11.26", features = ["blocking"] }
-tokio = { version = "1", features = ["full"] }
-winapi = "0.3.9"
-plotters = "0.3.7"
+httpsys = { path = "crates/httpsys" }
+windows.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+rand = "0.8"
+reqwest = { version = "0.11", features = ["blocking"] }
+plotters = "0.3"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+
+[[bench]]
+name = "helpers"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true

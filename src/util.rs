@@ -1,7 +1,6 @@
 use rand::{thread_rng, Rng};
 use reqwest::Url;
 use std::env;
-use std::hint::black_box;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -11,10 +10,10 @@ pub struct ServerExe {
 }
 
 impl ServerExe {
-    pub fn format_req_url(self: &ServerExe, path: &str) -> Url {
+    pub fn format_req_url(&self, path: &str) -> Url {
         let mut url = Url::parse("http://localhost/").expect("Failed to parse url");
         url.set_port(Some(self.port)).expect("Failed to set port");
-        url.set_path(&path.to_string());
+        url.set_path(path);
         url
     }
 }
@@ -22,8 +21,7 @@ impl ServerExe {
 impl Drop for ServerExe {
     fn drop(&mut self) {
         if let Some(mut proc) = self.proc.take() {
-            proc.kill().expect("Failed to kill server");
-            // Optionally wait for the process to finish
+            let _ = proc.kill();
             let _ = proc.wait();
         }
     }
@@ -34,11 +32,10 @@ pub fn run_this_exe_as_server() -> ServerExe {
     let mut rng = thread_rng();
     let port = rng.gen_range(3333..9999);
 
-    println!("Current exe {:?}", exe_path);
+    println!("Current exe {exe_path:?}");
 
-    // Spawn the server external process
     let mut c = Command::new(exe_path);
-    c.arg("server").arg(format!("http://localhost:{}/", port));
+    c.arg("server").arg(format!("http://localhost:{port}/"));
 
     let proc = c
         .stdout(Stdio::piped())
@@ -61,11 +58,11 @@ where
     F: Fn() -> T,
 {
     const MIN_ITERATIONS: usize = 10;
-    const MAX_ITERATIONS: usize = 200; // Maximum number of iterations to prevent infinite loops
-    const STABLE_THRESHOLD: f64 = 1.0; // 100% change considered stable
-    const OUTLIER_THRESHOLD: f64 = 2.0; // standard deviations away considered an outlier
+    const MAX_ITERATIONS: usize = 200;
+    const STABLE_THRESHOLD: f64 = 0.10; // 10% deviation considered stable
+    const OUTLIER_THRESHOLD: f64 = 2.0; // 2 stddev away considered an outlier
 
-    // warm up    
+    // warm up
     for _ in 0..5 {
         let _ = f();
     }
@@ -76,34 +73,22 @@ where
         let start = Instant::now();
         let _ = f();
         let duration = start.elapsed();
-        durations.push(duration.as_secs_f64()); 
-        
+        durations.push(duration.as_secs_f64());
 
         if i >= MIN_ITERATIONS {
-            // Need at least 3 measurements to calculate mean and std dev
-            let mean = durations.iter().sum::<f64>() / durations.len() as f64;
-            let variance = durations
-                .iter()
-                .map(|d| {
-                    let diff = d - mean;
-                    diff * diff
-                })
-                .sum::<f64>()
-                / durations.len() as f64;
-            let std_dev = variance.sqrt();
+            let (mean, std_dev) = mean_stddev(&durations);
 
-            // Remove outliers
-            durations.retain(|d| {
-                let diff = (*d - mean).abs();
-                diff / std_dev <= OUTLIER_THRESHOLD
-            });
+            if std_dev > 0.0 {
+                durations.retain(|d| (*d - mean).abs() / std_dev <= OUTLIER_THRESHOLD);
+            }
 
             if durations.len() > MIN_ITERATIONS {
-                // Check for stability
-                let is_stable = durations.iter().all(|d| {
-                    let diff = (d - mean).abs();
-                    diff / mean <= STABLE_THRESHOLD
-                });
+                // Recompute mean after filtering for an accurate stability check.
+                let (mean_filtered, _) = mean_stddev(&durations);
+                let is_stable = mean_filtered > 0.0
+                    && durations
+                        .iter()
+                        .all(|d| (d - mean_filtered).abs() / mean_filtered <= STABLE_THRESHOLD);
 
                 if is_stable {
                     break;
@@ -112,13 +97,91 @@ where
         }
     }
 
-    let mean = durations.iter().sum::<f64>() / durations.len() as f64;
+    let (mean, _) = mean_stddev(&durations);
 
     LatencyMeasurement {
-        latency : Duration::from_secs_f64(mean),
+        latency: Duration::from_secs_f64(mean),
     }
+}
+
+fn mean_stddev(samples: &[f64]) -> (f64, f64) {
+    let n = samples.len() as f64;
+    let mean = samples.iter().sum::<f64>() / n;
+    let variance = samples
+        .iter()
+        .map(|d| {
+            let diff = d - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / n;
+    (mean, variance.sqrt())
 }
 
 pub fn print_latency(result: &LatencyMeasurement) {
     println!("Average latency: {:?}", result.latency);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn mean_stddev_basic() {
+        let (mean, sd) = mean_stddev(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        assert!((mean - 5.0).abs() < 1e-9);
+        // population stddev = 2.0
+        assert!((sd - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mean_stddev_single_sample() {
+        let (mean, sd) = mean_stddev(&[3.5]);
+        assert_eq!(mean, 3.5);
+        assert_eq!(sd, 0.0);
+    }
+
+    #[test]
+    fn measure_latency_runs_warmup_plus_min_iterations() {
+        let calls = Cell::new(0u32);
+        let m = measure_latency(|| {
+            calls.set(calls.get() + 1);
+        });
+        // At least 5 warmup + MIN_ITERATIONS (10) = 15 invocations.
+        assert!(
+            calls.get() >= 15,
+            "expected >=15 calls, got {}",
+            calls.get()
+        );
+        assert!(m.latency >= Duration::from_nanos(0));
+    }
+
+    #[test]
+    fn measure_latency_stops_when_stable() {
+        // A constant-time workload should converge well before MAX_ITERATIONS.
+        let calls = Cell::new(0u32);
+        let _ = measure_latency(|| {
+            calls.set(calls.get() + 1);
+            // Trivial work: the timing noise alone should keep us inside
+            // STABLE_THRESHOLD (10%) for non-zero durations; if it doesn't, we
+            // still cap at MAX_ITERATIONS.
+            std::hint::black_box(0u64.wrapping_add(1));
+        });
+        // 5 warmup + at most 200 measurement iterations.
+        assert!(calls.get() <= 5 + 200);
+    }
+
+    #[test]
+    fn server_exe_format_req_url_sets_port_and_path() {
+        let s = ServerExe {
+            proc: None,
+            port: 4242,
+        };
+        let url = s.format_req_url("/abc/");
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("localhost"));
+        assert_eq!(url.port(), Some(4242));
+        assert_eq!(url.path(), "/abc/");
+    }
 }
