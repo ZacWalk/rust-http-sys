@@ -1,0 +1,32 @@
+[package]
+name = "httpbench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Head-to-head benchmark harness for the httpsys server and axum."
+publish = false
+
+[[bin]]
+name = "httpbench"
+path = "src/main.rs"
+
+[dependencies]
+httpsys.workspace = true
+windows.workspace = true
+
+bytes.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "io-util", "signal"] }
+
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+http-body-util = "0.1"
+hyper = { version = "1.11", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+clap = { version = "4.6", features = ["derive"] }
+plotters = { version = "0.3.7", default-features = false, features = [
+    "svg_backend",
+    "line_series",
+    "point_series",
+] }

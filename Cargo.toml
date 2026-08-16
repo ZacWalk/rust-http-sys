@@ -1,48 +1,42 @@
 [workspace]
-resolver = "2"
-members = [".", "crates/httpsys"]
+resolver = "3"
+members = ["crates/httpsys", "tools/httpbench"]
 
 [workspace.package]
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/microsoft/rust-http-sys"
 
 [workspace.dependencies]
-windows = { version = "0.48", features = [
+httpsys = { path = "crates/httpsys", version = "0.2.0" }
+
+windows = { version = "0.62", features = [
     "Win32_Foundation",
-    "Win32_Security",
     "Win32_Networking_HttpServer",
+    # HTTP_REQUEST_V1 embeds HTTP_TRANSPORT_ADDRESS, which is SOCKADDR-based.
     "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Threading",
 ] }
 atomic-waker = "1.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
-bytes = "1.5"
-
-[package]
-name = "test-httpsys"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-httpsys = { path = "crates/httpsys" }
-windows.workspace = true
-tokio.workspace = true
-bytes.workspace = true
-clap = { version = "4.5", features = ["derive"] }
-rand = "0.8"
-reqwest = { version = "0.11", features = ["blocking"] }
-plotters = "0.3"
-
-[dev-dependencies]
-criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
-
-[[bench]]
-name = "helpers"
-harness = false
+bytes = "1.12"
+crossbeam-queue = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1.53", default-features = false, features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 opt-level = 3
-strip = true
+
+# The sweep re-executes the harness as a server subprocess, so `cargo bench`
+# must produce the same optimised binary the charts are supposed to describe.
+[profile.bench]
+inherits = "release"

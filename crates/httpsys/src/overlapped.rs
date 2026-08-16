@@ -1,221 +1,322 @@
 //! `OVERLAPPED` plumbing shared by every async http.sys operation.
 //!
-//! The contract: every async operation allocates an [`OverlappedWrap`],
-//! transfers one strong reference to the kernel via [`Arc::into_raw`] (in the
-//! `OVERLAPPED` pointer), then awaits an [`AsyncOverlappedFuture`]. The IOCP
-//! callback reclaims the strong reference via [`Arc::from_raw`] and signals
-//! completion via an [`AtomicWaker`]. Dropping the future before completion
-//! cancels the operation with `CancelIoEx` and blocks until the callback
-//! has fired so the underlying buffer is no longer aliased by the kernel.
-
-use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc,
-};
+//! The contract: an [`Op`] allocates an [`OverlappedWrap`] and immediately
+//! transfers one strong reference to the kernel via [`Arc::into_raw`] (as the
+//! `OVERLAPPED` pointer). Exactly one of three things then happens:
+//!
+//! * the kernel rejects the submission — [`Op::finish`] reclaims the reference;
+//! * the kernel completes it inline and the queue handle has
+//!   `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` — [`Op::finish`] reclaims it;
+//! * the kernel queues it — an [`IoPort`](crate::iocp::IoPort) completion
+//!   thread reclaims it and wakes the [`AsyncOverlappedFuture`].
+//!
+//! Dropping the future before completion cancels the operation with
+//! `CancelIoEx` and blocks until the completion has fired, so the kernel never
+//! writes into a buffer that Rust has already reused.
 
 use std::{
     cell::UnsafeCell,
+    ffi::c_void,
     future::Future,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     task::{Context, Poll},
 };
 
 use atomic_waker::AtomicWaker;
-use windows::{
-    core::{Error as WinError, HRESULT},
-    Win32::{
-        Foundation::{HANDLE, WIN32_ERROR},
-        System::IO::{BindIoCompletionCallback, CancelIoEx, OVERLAPPED},
-    },
+use crossbeam_queue::ArrayQueue;
+use windows::Win32::{
+    Foundation::HANDLE,
+    System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED, OVERLAPPED_ENTRY},
 };
 
-/// Bind an `http.sys` request-queue handle to the process IOCP and route
-/// completions to [`private_callback`].
-pub(crate) fn register_iocp_handle(h: HANDLE) -> Result<(), WinError> {
-    // SAFETY: `h` is a kernel HANDLE supplied by the caller; passing a
-    // static function pointer is always sound.
-    let ok = unsafe { BindIoCompletionCallback(h, Some(private_callback), 0) };
-    ok.ok()
-}
+use crate::error::{Error, Result};
 
-/// IOCP completion callback.
-///
-/// SAFETY: Win32 guarantees `lpoverlapped` is the exact pointer that was
-/// passed to the originating `Http*` call and that it remains alive until
-/// this callback fires exactly once. We balance the leaked refcount with
-/// `Arc::from_raw`. `OverlappedWrap` is `#[repr(C)]` with `OVERLAPPED`
-/// first, so the pointer is layout-compatible.
-unsafe extern "system" fn private_callback(
-    dwerrorcode: u32,
-    dwnumberofbytestransferred: u32,
-    lpoverlapped: *mut OVERLAPPED,
-) {
-    let wrap_ptr = lpoverlapped as *const OverlappedWrap;
-    let arc: Arc<OverlappedWrap> = unsafe { Arc::from_raw(wrap_ptr) };
-    arc.complete(dwerrorcode, dwnumberofbytestransferred);
-}
-
-fn ec_to_hresult(ec: u32) -> HRESULT {
-    if ec == 0 {
-        HRESULT(0)
-    } else {
-        WinError::from(WIN32_ERROR(ec)).code()
-    }
-}
+/// Win32 `ERROR_IO_PENDING`: the operation was queued and will complete later.
+pub(crate) const ERROR_IO_PENDING: u32 = 997;
 
 /// `OVERLAPPED` plus the primitives used to deliver its completion to a Rust
-/// future. `#[repr(C)]` with `OVERLAPPED` as the first field so that an
-/// `*mut OverlappedWrap` is castable to/from `*mut OVERLAPPED`.
+/// future. `#[repr(C)]` with `OVERLAPPED` first so that an
+/// `*mut OverlappedWrap` is castable to and from `*mut OVERLAPPED`.
 #[repr(C)]
 pub(crate) struct OverlappedWrap {
-    o: UnsafeCell<OVERLAPPED>,
-    /// Set to `true` (Release) by the callback once `err` and `len` have
-    /// been written. Polled (Acquire) by the future.
+    /// Must stay the first field — see the type-level note above.
+    inner: UnsafeCell<OVERLAPPED>,
+    /// `pBytesReturned` out-parameter. It lives here, behind the `Arc` the
+    /// kernel holds, rather than on the submitting task's stack, so a late
+    /// kernel write can never land on a frame that has already been reused.
+    bytes: UnsafeCell<u32>,
+    /// Set to `true` (Release) by the completion path once `err` and `len`
+    /// have been written; loaded (Acquire) by the future.
     completed: AtomicBool,
     waker: AtomicWaker,
-    /// Written by the callback before `completed` is set; read by the
-    /// future once `completed == true`.
-    err: UnsafeCell<HRESULT>,
+    err: AtomicU32,
     len: AtomicU32,
 }
 
-// SAFETY: All cross-thread access to `o` and `err` is gated by the
-// Acquire/Release synchronization on `completed` plus `AtomicWaker`, which
-// establishes the happens-before relationship required for `UnsafeCell`.
-// The kernel writes `o` before posting the IOCP completion that triggers
-// `complete()`, which sets `completed = true` after writing `err`.
+// SAFETY: `overlapped` and `bytes` are only written by the kernel while it
+// holds the strong reference handed to it at submission time, and are only
+// read by the future after the Acquire load of `completed` (or, on the
+// synchronous path, before any submission is outstanding). That pairs with the
+// Release store in `complete`, so there is no data race on either `UnsafeCell`.
 unsafe impl Send for OverlappedWrap {}
+// SAFETY: as above.
 unsafe impl Sync for OverlappedWrap {}
 
-impl Default for OverlappedWrap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl OverlappedWrap {
-    pub(crate) fn new() -> Self {
-        OverlappedWrap {
-            o: UnsafeCell::new(OVERLAPPED::default()),
+    fn new() -> Arc<Self> {
+        Arc::new(OverlappedWrap {
+            inner: UnsafeCell::new(OVERLAPPED::default()),
+            bytes: UnsafeCell::new(0),
             completed: AtomicBool::new(false),
             waker: AtomicWaker::new(),
-            err: UnsafeCell::new(HRESULT(0)),
+            err: AtomicU32::new(0),
             len: AtomicU32::new(0),
-        }
+        })
     }
 
-    /// Pointer to the embedded `OVERLAPPED` for handing to Win32.
-    pub(crate) fn overlapped(&self) -> *mut OVERLAPPED {
-        self.o.get()
-    }
-
-    /// Transfer one strong reference to the kernel; returns a raw pointer
-    /// suitable for the IOCP callback to reclaim with `Arc::from_raw`.
-    pub(crate) fn leak_for_kernel(this: &Arc<Self>) -> *const OverlappedWrap {
-        Arc::into_raw(Arc::clone(this))
-    }
-
-    /// Called by the IOCP callback exactly once. Records the result and
-    /// wakes any awaiting future.
-    pub(crate) fn complete(&self, win32_err: u32, bytes: u32) {
-        // SAFETY: only the callback writes `err`, and it runs at most once
-        // per `OverlappedWrap`. The Release on `completed` publishes the
-        // write before any future-side reader can observe it.
-        unsafe {
-            *self.err.get() = ec_to_hresult(win32_err);
-        }
+    /// Record a completion and wake the awaiting future. Runs exactly once
+    /// per accepted submission.
+    fn complete(&self, win32_err: u32, bytes: u32) {
+        self.err.store(win32_err, Ordering::Relaxed);
         self.len.store(bytes, Ordering::Relaxed);
         self.completed.store(true, Ordering::Release);
         self.waker.wake();
     }
 
-    pub(crate) fn is_completed(&self) -> bool {
+    fn is_completed(&self) -> bool {
         self.completed.load(Ordering::Acquire)
     }
 
-    pub(crate) fn poll_complete(&self, cx: &Context<'_>) -> Poll<(HRESULT, u32)> {
+    fn result(&self) -> Result<u32> {
+        // Ordering::Relaxed is enough: the Acquire load of `completed` by the
+        // caller already synchronised with the Release store in `complete`.
+        match self.err.load(Ordering::Relaxed) {
+            0 => Ok(self.len.load(Ordering::Relaxed)),
+            e => Err(Error::Win32(e)),
+        }
+    }
+
+    fn poll_complete(&self, cx: &Context<'_>) -> Poll<Result<u32>> {
         if self.is_completed() {
-            return Poll::Ready(self.read_result());
+            return Poll::Ready(self.result());
         }
         self.waker.register(cx.waker());
+        // Re-check: the completion may have landed between the first load and
+        // the registration, in which case nobody will wake us again.
         if self.is_completed() {
-            return Poll::Ready(self.read_result());
+            return Poll::Ready(self.result());
         }
         Poll::Pending
     }
 
-    fn read_result(&self) -> (HRESULT, u32) {
-        // SAFETY: `completed` is Acquire-true here, synchronizing the
-        // writes performed by `complete`.
-        let hr = unsafe { *self.err.get() };
-        let len = self.len.load(Ordering::Relaxed);
-        (hr, len)
-    }
-
-    /// Spin-wait for completion; used only on cancellation paths. Bounded in
-    /// practice by IOCP latency (microseconds).
-    pub(crate) fn block_until_complete(&self) {
+    /// Spin until the completion path has run. Only reached on cancellation,
+    /// where the wait is bounded by IOCP dispatch latency.
+    fn block_until_complete(&self) {
         while !self.is_completed() {
+            std::hint::spin_loop();
             std::thread::yield_now();
         }
     }
-}
 
-/// Future that awaits an IOCP-backed Win32 operation. Owns one strong ref
-/// to the [`OverlappedWrap`]; the second is held by the kernel until the
-/// completion callback fires. Cancellation-safe: dropping before completion
-/// invokes `CancelIoEx` and waits for the callback.
-pub(crate) struct AsyncOverlappedFuture {
-    handle: HANDLE,
-    optr: Arc<OverlappedWrap>,
-}
+    fn overlapped(&self) -> *mut OVERLAPPED {
+        self.inner.get()
+    }
 
-impl AsyncOverlappedFuture {
-    pub(crate) fn new(handle: HANDLE, optr: Arc<OverlappedWrap>) -> Self {
-        Self { handle, optr }
+    /// Put a finished wrap back into its starting state so it can be reused.
+    ///
+    /// Takes `&mut self`, which is only obtainable through `Arc::get_mut`, so
+    /// this cannot run while the kernel still holds a reference.
+    fn reset(&mut self) {
+        *self.inner.get_mut() = OVERLAPPED::default();
+        *self.bytes.get_mut() = 0;
+        self.completed = AtomicBool::new(false);
+        self.waker = AtomicWaker::new();
+        self.err = AtomicU32::new(0);
+        self.len = AtomicU32::new(0);
     }
 }
 
+/// Free list of finished [`OverlappedWrap`]s.
+///
+/// Every async operation needs one, so without recycling the server would do a
+/// heap allocation per receive, per body chunk and per response.
+pub(crate) struct OpPool {
+    free: ArrayQueue<Arc<OverlappedWrap>>,
+}
+
+impl OpPool {
+    pub(crate) fn new(slots: usize) -> Self {
+        Self {
+            free: ArrayQueue::new(slots.max(1)),
+        }
+    }
+
+    fn take(&self) -> Arc<OverlappedWrap> {
+        self.free.pop().unwrap_or_else(OverlappedWrap::new)
+    }
+
+    fn give_back(&self, mut wrap: Arc<OverlappedWrap>) {
+        // A second reference means a completion thread has not finished with
+        // it yet; let that one go rather than risk reusing it underneath.
+        let Some(unique) = Arc::get_mut(&mut wrap) else {
+            return;
+        };
+        unique.reset();
+        let _ = self.free.push(wrap);
+    }
+}
+
+/// Deliver one `GetQueuedCompletionStatusEx` entry to its awaiting future.
+///
+/// # Safety
+///
+/// `entry` must be a completion packet produced by an operation whose
+/// `OVERLAPPED` came from [`Op::new`], and whose completion key is the file
+/// handle the operation was issued against. The kernel posts at most one
+/// packet per accepted submission, so the strong reference reclaimed here is
+/// reclaimed exactly once.
+pub(crate) unsafe fn deliver_completion(entry: &OVERLAPPED_ENTRY) {
+    // SAFETY: precondition — the pointer is the one leaked by `Op::new`, and
+    // `OverlappedWrap` is `#[repr(C)]` with `OVERLAPPED` first.
+    let wrap = unsafe { Arc::from_raw(entry.lpOverlapped.cast_const().cast::<OverlappedWrap>()) };
+    let file = HANDLE(entry.lpCompletionKey as *mut c_void);
+    // `GetOverlappedResult` is only here for the status; the byte count comes
+    // from the completion packet itself.
+    let mut ignored = 0u32;
+    // SAFETY: the operation is finished (we just dequeued its packet), so this
+    // reads the already-recorded status without blocking.
+    let status = unsafe { GetOverlappedResult(file, entry.lpOverlapped, &mut ignored, false) };
+    let err = match status {
+        Ok(()) => 0,
+        Err(e) => Error::from(e).win32_code().unwrap_or(0),
+    };
+    wrap.complete(err, entry.dwNumberOfBytesTransferred);
+}
+
+/// One in-flight overlapped operation.
+///
+/// Construct it, hand [`Op::overlapped`] and [`Op::bytes_ptr`] to the `Http*`
+/// call, then pass the returned status code to [`Op::finish`]. `finish` must
+/// be called, otherwise the reference transferred to the kernel is leaked.
+#[must_use = "the reference handed to the kernel is only reclaimed by `finish`"]
+pub(crate) struct Op<'a> {
+    handle: HANDLE,
+    wrap: Arc<OverlappedWrap>,
+    /// The strong reference transferred to the kernel.
+    leaked: *const OverlappedWrap,
+    pool: &'a OpPool,
+    skip_on_success: bool,
+}
+
+// SAFETY: `leaked` merely names the `Send + Sync` `OverlappedWrap` that
+// `wrap` also points at; the handle is a kernel object.
+unsafe impl Send for Op<'_> {}
+
+impl<'a> Op<'a> {
+    /// Take completion state from `pool` and transfer one strong reference to
+    /// the kernel. `skip_on_success` must reflect whether the handle was
+    /// accepted for `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`.
+    pub(crate) fn new(handle: HANDLE, pool: &'a OpPool, skip_on_success: bool) -> Self {
+        let wrap = pool.take();
+        let leaked = Arc::into_raw(Arc::clone(&wrap));
+        Op {
+            handle,
+            wrap,
+            leaked,
+            pool,
+            skip_on_success,
+        }
+    }
+
+    pub(crate) fn overlapped(&self) -> *mut OVERLAPPED {
+        self.wrap.overlapped()
+    }
+
+    pub(crate) fn bytes_ptr(&self) -> *mut u32 {
+        self.wrap.bytes.get()
+    }
+
+    /// The byte count the kernel reported through [`Op::bytes_ptr`].
+    ///
+    /// Only meaningful once the `Http*` call has returned something other than
+    /// `ERROR_IO_PENDING`, because until then the kernel may still write it.
+    pub(crate) fn reported_bytes(&self) -> u32 {
+        // SAFETY: no completion is outstanding, so this is the only reader.
+        unsafe { *self.wrap.bytes.get() }
+    }
+
+    /// Resolve the operation from the status code the `Http*` call returned.
+    pub(crate) async fn finish(self, ec: u32) -> Result<u32> {
+        match ec {
+            // Completed inline and the I/O manager suppressed the completion
+            // packet, so the byte count is already in place and nobody else
+            // will ever touch this `OverlappedWrap`.
+            0 if self.skip_on_success => {
+                let bytes = self.reported_bytes();
+                self.reclaim();
+                self.pool.give_back(self.wrap);
+                Ok(bytes)
+            }
+            0 | ERROR_IO_PENDING => {
+                let result = AsyncOverlappedFuture {
+                    handle: self.handle,
+                    wrap: Arc::clone(&self.wrap),
+                }
+                .await;
+                self.pool.give_back(self.wrap);
+                result
+            }
+            // The kernel refused the operation, so no packet will arrive.
+            other => {
+                self.reclaim();
+                self.pool.give_back(self.wrap);
+                Err(Error::Win32(other))
+            }
+        }
+    }
+
+    /// Take back the reference handed to the kernel. Only valid when no
+    /// completion packet can arrive for this operation.
+    fn reclaim(&self) {
+        // SAFETY: `leaked` came from `Arc::into_raw` in `new`, and `finish`
+        // consumes `self`, so this runs at most once per `Op`.
+        unsafe { drop(Arc::from_raw(self.leaked)) };
+    }
+}
+
+/// Awaits a queued overlapped operation. Dropping it before completion
+/// cancels the operation and waits for the kernel to relinquish the buffer.
+struct AsyncOverlappedFuture {
+    handle: HANDLE,
+    wrap: Arc<OverlappedWrap>,
+}
+
+// SAFETY: `handle` is a kernel object and `OverlappedWrap` is `Send + Sync`,
+// so the future can be polled from whichever worker thread picks it up.
+unsafe impl Send for AsyncOverlappedFuture {}
+
 impl Future for AsyncOverlappedFuture {
-    type Output = (HRESULT, u32);
+    type Output = Result<u32>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.optr.poll_complete(cx)
+        self.wrap.poll_complete(cx)
     }
 }
 
 impl Drop for AsyncOverlappedFuture {
     fn drop(&mut self) {
-        if !self.optr.is_completed() {
-            // SAFETY: `self.optr.overlapped()` is the same pointer that was
-            // submitted to Win32 and is still alive (we hold an Arc ref).
-            unsafe {
-                let _ = CancelIoEx(self.handle, Some(self.optr.overlapped()));
-            }
-            self.optr.block_until_complete();
+        if self.wrap.is_completed() {
+            return;
         }
-    }
-}
-
-/// Newtype around the leaked `*const OverlappedWrap` so the future type
-/// returned by submit-and-await stays `Send` even with the raw pointer in
-/// scope. The pointer itself is a kernel-borrowed reference to a
-/// `Send + Sync` value.
-#[derive(Copy, Clone)]
-pub(crate) struct LeakedOverlapped(pub(crate) *const OverlappedWrap);
-
-// SAFETY: the pointee `OverlappedWrap` is Send + Sync; the raw pointer
-// merely identifies it for the kernel.
-unsafe impl Send for LeakedOverlapped {}
-unsafe impl Sync for LeakedOverlapped {}
-
-impl LeakedOverlapped {
-    /// Reclaim the leaked Arc strong-ref. Used when the kernel rejected
-    /// the submission so the callback will never fire.
-    ///
-    /// SAFETY: must be called at most once per leak, and only when the
-    /// kernel did not accept the submission.
-    pub(crate) unsafe fn reclaim(self) {
-        unsafe { drop(Arc::from_raw(self.0)) };
+        // SAFETY: this is the exact `OVERLAPPED` submitted against `handle`,
+        // and we still hold a strong reference to it.
+        unsafe {
+            let _ = CancelIoEx(self.handle, Some(self.wrap.overlapped()));
+        }
+        self.wrap.block_until_complete();
     }
 }

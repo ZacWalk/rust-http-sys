@@ -1,122 +1,129 @@
-//! Loom tests for the `OverlappedWrap` completion handshake.
+//! Loom model of the `OverlappedWrap` completion handshake.
 //!
 //! Run with:
-//!     RUSTFLAGS="--cfg loom" cargo test --test loom --release -- --test-threads=1
+//!     $env:RUSTFLAGS = "--cfg loom"
+//!     cargo test -p httpsys --test loom --release -- --test-threads=1
+//!     Remove-Item Env:\RUSTFLAGS
 //!
-//! `OverlappedWrap` itself depends on Win32 types and lives behind an IOCP
-//! callback boundary that loom can't model directly. These tests reproduce
-//! the *same synchronization protocol* (Release store on a flag, Acquire
-//! load, then non-atomic read of the data) so loom can model-check that no
-//! interleaving observes partial state.
+//! `OverlappedWrap` itself is welded to Win32 types and an IOCP boundary that
+//! loom cannot model. These tests reproduce the same protocol — Relaxed stores
+//! of the payload, a Release store on `completed`, an Acquire load before
+//! reading it back — so loom can check that no interleaving lets a reader
+//! observe `completed` without the values that belong with it.
 
 #![cfg(loom)]
 
 use loom::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use loom::thread;
-use std::cell::UnsafeCell;
 
-/// Stand-in for `OverlappedWrap`. Same shape, no Win32 deps.
+/// Stand-in for `OverlappedWrap`, minus the Win32 fields.
 struct Wrap {
     completed: AtomicBool,
-    err: UnsafeCell<u32>,
+    err: AtomicU32,
     len: AtomicU32,
 }
-
-unsafe impl Send for Wrap {}
-unsafe impl Sync for Wrap {}
 
 impl Wrap {
     fn new() -> Self {
         Self {
             completed: AtomicBool::new(false),
-            err: UnsafeCell::new(0),
+            err: AtomicU32::new(0),
             len: AtomicU32::new(0),
         }
     }
 
-    /// Mirror of `OverlappedWrap::complete` — kernel callback side.
+    /// Mirror of `OverlappedWrap::complete` — the completion-thread side.
     fn complete(&self, err: u32, len: u32) {
-        unsafe {
-            *self.err.get() = err;
-        }
+        self.err.store(err, Ordering::Relaxed);
         self.len.store(len, Ordering::Relaxed);
         self.completed.store(true, Ordering::Release);
     }
 
-    /// Mirror of `OverlappedWrap::poll_complete` — future side. Returns
-    /// `Some((err,len))` once `complete()` has been observed.
+    /// Mirror of `OverlappedWrap::poll_complete` — the future side.
     fn try_take(&self) -> Option<(u32, u32)> {
         if self.completed.load(Ordering::Acquire) {
-            // SAFETY: completed → callback finished writing err; only one
-            // future-side reader.
-            let err = unsafe { *self.err.get() };
-            let len = self.len.load(Ordering::Relaxed);
-            Some((err, len))
+            Some((
+                self.err.load(Ordering::Relaxed),
+                self.len.load(Ordering::Relaxed),
+            ))
         } else {
             None
         }
     }
 }
 
-/// Single-completion path: kernel writes, future eventually observes.
+/// A completion is eventually observed, carrying exactly the values written.
 #[test]
 fn completion_is_observed_with_correct_values() {
     loom::model(|| {
-        let w = Arc::new(Wrap::new());
+        let wrap = Arc::new(Wrap::new());
 
-        let cb = {
-            let w = w.clone();
-            thread::spawn(move || w.complete(0x1234, 42))
+        let completer = {
+            let wrap = wrap.clone();
+            thread::spawn(move || wrap.complete(0x1234, 42))
         };
 
-        // Future side spins until visible (loom explores all interleavings).
         let mut observed = None;
         for _ in 0..3 {
-            if let Some(v) = w.try_take() {
-                observed = Some(v);
+            if let Some(value) = wrap.try_take() {
+                observed = Some(value);
                 break;
             }
             thread::yield_now();
         }
-        cb.join().unwrap();
+        completer.join().unwrap();
 
-        // After joining, completion must be visible and carry the values
-        // we wrote. Either we already observed them, or we observe now.
-        let (err, len) = observed.unwrap_or_else(|| w.try_take().expect("must be visible"));
-        assert_eq!(err, 0x1234);
-        assert_eq!(len, 42);
+        let result = observed.unwrap_or_else(|| wrap.try_take().expect("must be visible"));
+        assert_eq!(result, (0x1234, 42));
     });
 }
 
-/// Race between completion and pre-completion poll: the poll must either
-/// see Pending (then a later poll succeeds) or see the completed values —
-/// never partial state.
+/// Racing a poll against the completion must yield either Pending or the whole
+/// result — never a half-written one.
 #[test]
 fn poll_never_observes_partial_state() {
     loom::model(|| {
-        let w = Arc::new(Wrap::new());
+        let wrap = Arc::new(Wrap::new());
 
-        let cb = {
-            let w = w.clone();
-            thread::spawn(move || w.complete(7, 11))
+        let completer = {
+            let wrap = wrap.clone();
+            thread::spawn(move || wrap.complete(7, 11))
         };
 
-        let early = w.try_take();
-        cb.join().unwrap();
-        let late = w.try_take();
+        let early = wrap.try_take();
+        completer.join().unwrap();
 
-        // Once `late` succeeds, values must match what the callback wrote.
-        let (err, len) = late.expect("must be complete after join");
-        assert_eq!(err, 7);
-        assert_eq!(len, 11);
-
-        // If we did observe early, we must have observed the same thing.
-        if let Some((eerr, elen)) = early {
-            assert_eq!(eerr, 7);
-            assert_eq!(elen, 11);
+        assert_eq!(wrap.try_take(), Some((7, 11)));
+        if let Some(observed) = early {
+            assert_eq!(observed, (7, 11));
         }
+    });
+}
+
+/// The cancellation path spins on `completed`; it must not be able to leave
+/// the spin before the payload is visible.
+#[test]
+fn blocking_wait_sees_the_payload() {
+    loom::model(|| {
+        let wrap = Arc::new(Wrap::new());
+
+        let completer = {
+            let wrap = wrap.clone();
+            // ERROR_OPERATION_ABORTED, what CancelIoEx produces.
+            thread::spawn(move || wrap.complete(995, 0))
+        };
+
+        let mut result = None;
+        while result.is_none() {
+            result = wrap.try_take();
+            if result.is_none() {
+                thread::yield_now();
+            }
+        }
+        assert_eq!(result, Some((995, 0)));
+        completer.join().unwrap();
     });
 }

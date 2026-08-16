@@ -1,38 +1,55 @@
-//! `httpsys` — async Rust wrapper around the Windows `http.sys` server APIs.
+//! `httpsys` — an async Rust wrapper around the Windows `http.sys` server API.
 //!
 //! ```no_run
-//! use httpsys::{Response, ServerBuilder};
+//! use httpsys::{Request, Response, ServerBuilder, status};
 //!
 //! # fn main() -> httpsys::Result<()> {
-//! let mut server = ServerBuilder::new()?;
-//! server.route("http://+:8080/api/", |_req| async {
-//!     Response::ok_text("hello")
+//! let mut builder = ServerBuilder::new()?;
+//! builder.route("http://+:8080/api/", |request: Request| async move {
+//!     match request.body().await {
+//!         Ok(body) => Response::ok_text(format!("{} bytes", body.len())),
+//!         Err(_) => Response::new(status::BAD_REQUEST),
+//!     }
 //! })?;
-//! let mut handle = server.run();
-//! # handle.shutdown();
-//! handle.join();
+//!
+//! let mut server = builder.run();
+//! // ... do other work ...
+//! server.shutdown();
+//! server.join();
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! ## Design
+//! # How it goes fast
 //!
-//! - The kernel queue handle is bound to the process IOCP via
-//!   `BindIoCompletionCallback`. Each async operation owns an
-//!   [`overlapped::OverlappedWrap`] whose strong reference is leaked into
-//!   the kernel and reclaimed by the IOCP callback.
-//! - Cancellation is safe: dropping the future calls `CancelIoEx` and
-//!   blocks until the callback releases its reference, so the buffer is
-//!   never reused while the kernel may still be writing to it.
-//! - The high-level [`Server`] spawns multiple concurrent receivers and
-//!   gates handler concurrency with a [`tokio::sync::Semaphore`].
-//! - Graceful shutdown calls `HttpShutdownRequestQueue` and waits for
-//!   in-flight handlers to drain (configurable timeout).
+//! * **Its own completion port.** The queue handle is associated with a
+//!   dedicated IOCP whose threads drain completions in batches with
+//!   `GetQueuedCompletionStatusEx`, instead of paying a Win32 thread-pool
+//!   dispatch per completion as `BindIoCompletionCallback` does.
+//! * **No round trip for inline completions.** The handle is put into
+//!   `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` mode, so a receive that http.sys
+//!   can satisfy from an already-queued request never touches the port at all.
+//! * **One syscall per request.** Requests are received with
+//!   `HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY`, so headers and body arrive
+//!   together and [`Request::body`] usually returns a borrowed slice.
+//! * **No allocation on the hot path.** Receive buffers are recycled through a
+//!   lock-free pool, and [`Response`] holds its body as [`bytes::Bytes`].
+//! * **No task churn.** A fixed set of request slots each own a request from
+//!   receive to response, so there is no per-request spawn or semaphore.
+//!
+//! # Safety model
+//!
+//! Every async operation owns an `OVERLAPPED` whose strong reference is handed
+//! to the kernel and reclaimed exactly once — by the completion thread, or by
+//! the submitting task when the kernel completes inline or refuses the call.
+//! Dropping a future before completion issues `CancelIoEx` and blocks until
+//! the completion has fired, so the kernel never writes into a buffer Rust has
+//! already reused.
 
-#![cfg_attr(docsrs, feature(doc_cfg))]
-
+mod buffer;
 mod error;
 mod init;
+mod iocp;
 mod overlapped;
 mod queue;
 mod request;
@@ -42,6 +59,6 @@ mod server;
 pub use error::{Error, Result};
 pub use init::{HttpInitializer, ServerSession, UrlGroup};
 pub use queue::RequestQueue;
-pub use request::{Method, Request};
-pub use response::{status, Response};
+pub use request::{Body, Method, Request};
+pub use response::{Response, status};
 pub use server::{Handler, Server, ServerBuilder, ServerConfig};
